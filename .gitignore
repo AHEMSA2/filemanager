@@ -1,1 +1,7 @@
+config.json
+.venv/
+__pycache__/
+*.pyc
+logs/
+usb_backups/
 

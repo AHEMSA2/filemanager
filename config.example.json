@@ -1,7 +1,7 @@
 {
-  "bot_token": "8759494356:AAEno7os_uQm3iP9nXQejJViXGZ1HArm66M",
-  "allowed_chat_id": 6456580255,
-  "web_password": "password",
+  "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "allowed_chat_id": 123456789,
+  "web_password": "change_me",
   "web_port": 5000,
   "base_dir": "/",
   "usb_backup_dir": "/srv/usb_backups",

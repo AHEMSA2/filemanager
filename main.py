@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -8,8 +9,9 @@ import threading
 import psutil
 import telebot
 from flask import Flask, redirect, render_template_string, request, send_file, session, url_for
-from markupsafe import escape
 from werkzeug.utils import secure_filename
+
+from services import APService, PowerService, USBService
 
 # ================= CONFIG =================
 
@@ -40,7 +42,29 @@ def _load_config():
     _require("web_password", str)
     _require("web_port", int)
     _require("base_dir", str)
-    _require("logs_dir", str)
+
+    def _optional(key, expected_type, default):
+        if key not in cfg:
+            cfg[key] = default
+        elif not isinstance(cfg[key], expected_type):
+            errors.append(f"  - '{key}' alanı {expected_type.__name__} olmalı, şu an: {type(cfg[key]).__name__}")
+
+    default_usb_backup = "/srv/usb_backups" if os.name != "nt" else os.path.join(cfg.get("base_dir", "."), "usb_backups")
+    _optional("usb_backup_dir", str, default_usb_backup)
+    _optional("usb_auto_enabled", bool, True)
+    _optional("power_min_seconds", int, 0)
+    _optional("power_max_seconds", int, 86400)
+    _optional("ap_enabled", bool, True)
+    _optional("ap_interface", str, "auto")
+    _optional("ap_ssid", str, "FileManager-AP")
+    _optional("ap_password", str, "ChangeMe123")
+
+    if isinstance(cfg.get("power_min_seconds"), int) and isinstance(cfg.get("power_max_seconds"), int):
+        if cfg["power_min_seconds"] < 0 or cfg["power_max_seconds"] < cfg["power_min_seconds"]:
+            errors.append("  - 'power_min_seconds' ve 'power_max_seconds' değerleri geçersiz")
+
+    if cfg.get("ap_enabled") and isinstance(cfg.get("ap_password"), str) and len(cfg["ap_password"]) < 8:
+        errors.append("  - 'ap_password' en az 8 karakter olmalı")
 
     if errors:
         sys.exit("[!] config.json hataları:\n" + "\n".join(errors))
@@ -54,15 +78,28 @@ ALLOWED_CHAT_ID = _cfg["allowed_chat_id"]
 WEB_PASSWORD    = _cfg["web_password"]
 WEB_PORT        = _cfg["web_port"]
 BASE_DIR        = _cfg["base_dir"]
-LOGS_DIR        = _cfg["logs_dir"]
-
-# Logs dizinini oluştur
-os.makedirs(LOGS_DIR, exist_ok=True)
+USB_BACKUP_DIR  = _cfg["usb_backup_dir"]
+USB_AUTO_ENABLED = _cfg["usb_auto_enabled"]
+POWER_MIN_SECONDS = _cfg["power_min_seconds"]
+POWER_MAX_SECONDS = _cfg["power_max_seconds"]
+AP_ENABLED = _cfg["ap_enabled"]
+AP_INTERFACE = _cfg["ap_interface"]
+AP_SSID = _cfg["ap_ssid"]
+AP_PASSWORD = _cfg["ap_password"]
 
 # ================= SABİTLER =================
 MAX_CMDLINE_WEB  = 120   # web süreç listesinde gösterilecek komut karakter limiti
 MAX_CMDLINE_TG   = 40    # Telegram mesajında gösterilecek komut karakter limiti
 MAX_PROCESSES    = 40    # gösterilecek maksimum süreç sayısı
+
+try:
+    usb_service = USBService(USB_BACKUP_DIR, auto_enabled=USB_AUTO_ENABLED)
+except OSError:
+    fallback_usb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usb_backups")
+    usb_service = USBService(fallback_usb_dir, auto_enabled=USB_AUTO_ENABLED)
+
+power_service = PowerService(min_seconds=POWER_MIN_SECONDS, max_seconds=POWER_MAX_SECONDS)
+ap_service = APService(enabled=AP_ENABLED, interface=AP_INTERFACE, ssid=AP_SSID, password=AP_PASSWORD)
 
 # ================= HTML ŞABLONU =================
 HTML_TEMPLATE = """
@@ -89,6 +126,9 @@ HTML_TEMPLATE = """
         <div class="nav-links">
             <a href="/">📁 Dosya Yöneticisi</a>
             <a href="/processes">⚙️ Süreçler</a>
+            <a href="/usb">💾 USB</a>
+            <a href="/power">🔌 Güç</a>
+            <a href="/ap">📡 Access Point</a>
         </div>
         <h2>Dizin: {{ path }}</h2>
         
@@ -113,7 +153,7 @@ HTML_TEMPLATE = """
             {% if search_results %}
                 <h3>Arama Sonuçları</h3>
                 {% for res in search_results %}
-                    <div class="item">🔍 <a href="?path={{ res_path }}">{{ res }}</a></div>
+                    <div class="item">🔍 <a href="?path={{ res }}">{{ res }}</a></div>
                 {% endfor %}
             {% else %}
                 <h3>Klasörler</h3>
@@ -165,6 +205,9 @@ PROCESSES_TEMPLATE = """
         <div class="nav-links">
             <a href="/">📁 Dosya Yöneticisi</a>
             <a href="/processes">⚙️ Süreçler</a>
+            <a href="/usb">💾 USB</a>
+            <a href="/power">🔌 Güç</a>
+            <a href="/ap">📡 Access Point</a>
         </div>
         <h2>⚙️ Çalışan Süreçler</h2>
 
@@ -198,6 +241,223 @@ PROCESSES_TEMPLATE = """
                 {% endfor %}
                 </tbody>
             </table>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+USB_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>USB Yönetimi - Server Manager</title>
+    <style>
+        body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        a { color: #58a6ff; text-decoration: none; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .panel { background: #161b22; padding: 15px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 20px; }
+        .nav-links { margin-bottom: 10px; }
+        .nav-links a { margin-right: 15px; }
+        .flash { padding: 10px; background: #1f2d1f; border: 1px solid #238636; border-radius: 4px; margin-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; }
+        button, input[type="submit"] { background: #238636; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .btn-copy { background: #9e6a03; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-links">
+            <a href="/">📁 Dosya Yöneticisi</a>
+            <a href="/processes">⚙️ Süreçler</a>
+            <a href="/usb">💾 USB</a>
+            <a href="/power">🔌 Güç</a>
+            <a href="/ap">📡 Access Point</a>
+        </div>
+        <h2>💾 USB Yönetimi</h2>
+
+        {% if message %}
+        <div class="flash">{{ message }}</div>
+        {% endif %}
+
+        <div class="panel">
+            <p>Yedek hedefi: {{ status.backup_root }}</p>
+            <p>Otomatik kopyalama: <strong>{{ 'Açık' if status.auto_enabled else 'Kapalı' }}</strong></p>
+            <p>İzleyici durumu: <strong>{{ 'Çalışıyor' if status.monitor_running else 'Durdu' }}</strong></p>
+            <form method="post" action="/usb/toggle">
+                <input type="hidden" name="enable" value="{{ 0 if status.auto_enabled else 1 }}">
+                <button type="submit">{{ 'Otomatik Kopyalamayı Kapat' if status.auto_enabled else 'Otomatik Kopyalamayı Aç' }}</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <h3>Takılı USB Cihazları</h3>
+            <table>
+                <thead>
+                    <tr><th>Cihaz</th><th>Mount</th><th>FS</th><th>İşlem</th></tr>
+                </thead>
+                <tbody>
+                {% for dev in devices %}
+                <tr>
+                    <td>{{ dev.device }}</td>
+                    <td>{{ dev.mountpoint }}</td>
+                    <td>{{ dev.fstype }}</td>
+                    <td>
+                        <form method="post" action="/usb/copy" style="display:inline;">
+                            <input type="hidden" name="mountpoint" value="{{ dev.mountpoint }}">
+                            <button type="submit" class="btn-copy">Şimdi Kopyala</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+POWER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Güç Yönetimi - Server Manager</title>
+    <style>
+        body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        a { color: #58a6ff; text-decoration: none; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .panel { background: #161b22; padding: 15px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 20px; }
+        .nav-links { margin-bottom: 10px; }
+        .nav-links a { margin-right: 15px; }
+        .flash { padding: 10px; background: #1f2d1f; border: 1px solid #238636; border-radius: 4px; margin-bottom: 10px; }
+        input[type="number"] { background: #0d1117; color: white; border: 1px solid #30363d; padding: 5px; }
+        button, input[type="submit"] { background: #238636; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .btn-danger { background: #da3633; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-links">
+            <a href="/">📁 Dosya Yöneticisi</a>
+            <a href="/processes">⚙️ Süreçler</a>
+            <a href="/usb">💾 USB</a>
+            <a href="/power">🔌 Güç</a>
+            <a href="/ap">📡 Access Point</a>
+        </div>
+        <h2>🔌 Güç Yönetimi</h2>
+
+        {% if message %}
+        <div class="flash">{{ message }}</div>
+        {% endif %}
+
+        <div class="panel">
+            <form method="post" action="/power/schedule" style="margin-bottom:10px;">
+                <input type="hidden" name="action" value="shutdown">
+                <label>Kapatma (saniye):</label>
+                <input type="number" name="seconds" min="{{ status.min_seconds }}" max="{{ status.max_seconds }}" value="30">
+                <input type="submit" value="Planla">
+            </form>
+
+            <form method="post" action="/power/schedule" style="margin-bottom:10px;">
+                <input type="hidden" name="action" value="reboot">
+                <label>Yeniden Başlatma (saniye):</label>
+                <input type="number" name="seconds" min="{{ status.min_seconds }}" max="{{ status.max_seconds }}" value="30">
+                <input type="submit" value="Planla">
+            </form>
+
+            <form method="post" action="/power/cancel">
+                <button type="submit" class="btn-danger">Tüm Planlı Güç İşlemlerini İptal Et</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <h3>Planlı İşlemler</h3>
+            {% if status.scheduled %}
+                {% for item in status.scheduled %}
+                <div>{{ item.unit }} - {{ 'Aktif' if item.active else 'Pasif' }}</div>
+                {% endfor %}
+            {% else %}
+                <div>Aktif planlı işlem yok.</div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+AP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Access Point - Server Manager</title>
+    <style>
+        body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        a { color: #58a6ff; text-decoration: none; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .panel { background: #161b22; padding: 15px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 20px; }
+        .nav-links { margin-bottom: 10px; }
+        .nav-links a { margin-right: 15px; }
+        .flash { padding: 10px; background: #1f2d1f; border: 1px solid #238636; border-radius: 4px; margin-bottom: 10px; }
+        input[type="text"], input[type="password"] { background: #0d1117; color: white; border: 1px solid #30363d; padding: 5px; }
+        button, input[type="submit"] { background: #238636; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .btn-danger { background: #da3633; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-links">
+            <a href="/">📁 Dosya Yöneticisi</a>
+            <a href="/processes">⚙️ Süreçler</a>
+            <a href="/usb">💾 USB</a>
+            <a href="/power">🔌 Güç</a>
+            <a href="/ap">📡 Access Point</a>
+        </div>
+        <h2>📡 Access Point Yönetimi</h2>
+
+        {% if message %}
+        <div class="flash">{{ message }}</div>
+        {% endif %}
+
+        <div class="panel">
+            <form method="post" action="/ap/start" style="margin-bottom:10px;">
+                <label>SSID:</label>
+                <input type="text" name="ssid" placeholder="{{ default_ssid }}">
+                <label>Parola:</label>
+                <input type="password" name="password" placeholder="********">
+                <input type="submit" value="AP Başlat">
+            </form>
+
+            <form method="post" action="/ap/stop">
+                <button type="submit" class="btn-danger">AP Durdur</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <h3>Durum</h3>
+            <div>AP Özelliği: {{ 'Açık' if status.enabled else 'Kapalı' }}</div>
+            <div>nmcli: {{ 'Var' if status.nmcli_exists else 'Yok' }}</div>
+            <div>Arayüz Ayarı: {{ status.interface }}</div>
+            <h4>Aktif Wi-Fi Bağlantıları</h4>
+            {% if status.active_wifi %}
+                {% for conn in status.active_wifi %}
+                <div>{{ conn.name }} ({{ conn.device }})</div>
+                {% endfor %}
+            {% else %}
+                <div>Aktif AP bağlantısı yok.</div>
+            {% endif %}
+        </div>
+
+        <div class="panel">
+            <h3>Bağlı İstemciler</h3>
+            {% if clients %}
+                {% for client in clients %}
+                <div>{{ client }}</div>
+                {% endfor %}
+            {% else %}
+                <div>Bağlı istemci listesi boş.</div>
+            {% endif %}
         </div>
     </div>
 </body>
@@ -272,27 +532,22 @@ def upload():
 
 
 def _launch_file(file_path):
-    """Launch a file non-blocking; return (proc, log_path) or raise."""
-    os.makedirs(LOGS_DIR, exist_ok=True)
+    """Launch a file non-blocking and return process handle."""
     ext = os.path.splitext(file_path)[1].lower()
     if os.access(file_path, os.X_OK):
         cmd = [file_path]
     elif ext == ".py":
-        cmd = ["python3", file_path]
+        cmd = [shutil.which("python3") or sys.executable, file_path]
     elif ext == ".sh":
-        cmd = ["bash", file_path]
+        cmd = [shutil.which("bash") or "/bin/sh", file_path]
     else:
-        cmd = ["xdg-open", file_path]
+        opener = shutil.which("xdg-open")
+        if not opener:
+            raise RuntimeError("xdg-open bulunamadı")
+        cmd = [opener, file_path]
 
-    # Placeholder log path — updated after Popen so we know the PID
-    tmp_log = os.path.join(LOGS_DIR, "pending.log")
-    log_fh = open(tmp_log, "w")
-    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh, close_fds=True)
-    log_fh.close()
-
-    log_path = os.path.join(LOGS_DIR, f"{proc.pid}.log")
-    os.rename(tmp_log, log_path)
-    return proc, log_path
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    return proc
 
 
 @app.route('/run_file')
@@ -302,10 +557,10 @@ def run_file():
     if not file_path or not os.path.isfile(file_path):
         return "Dosya bulunamadı", 404
     try:
-        proc, log_path = _launch_file(file_path)
-        return f"Başlatıldı — PID: {proc.pid} | Log: {escape(log_path)}", 200
-    except Exception:
-        return "Dosya başlatılamadı.", 500
+        proc = _launch_file(file_path)
+        return f"Başlatıldı — PID: {proc.pid}", 200
+    except Exception as exc:
+        return f"Dosya başlatılamadı: {exc}", 500
 
 
 def _get_processes(filter_text=""):
@@ -348,6 +603,100 @@ def kill_process():
     return redirect(url_for('processes_page', message=msg))
 
 
+@app.route('/usb')
+@login_required
+def usb_page():
+    message = request.args.get('message', '')
+    devices = usb_service.list_mounts()
+    status = usb_service.get_status()
+    return render_template_string(USB_TEMPLATE, message=message, devices=devices, status=status)
+
+
+@app.route('/usb/toggle', methods=['POST'])
+@login_required
+def usb_toggle():
+    enabled = request.form.get('enable', '1') == '1'
+    ok, msg = usb_service.set_auto_enabled(enabled)
+    if ok and enabled:
+        usb_service.start_auto_monitor()
+    return redirect(url_for('usb_page', message=msg))
+
+
+@app.route('/usb/copy', methods=['POST'])
+@login_required
+def usb_copy():
+    mountpoint = request.form.get('mountpoint', '').strip()
+    ok, msg = usb_service.trigger_copy(mountpoint)
+    return redirect(url_for('usb_page', message=msg))
+
+
+@app.route('/power')
+@login_required
+def power_page():
+    message = request.args.get('message', '')
+    status = power_service.status()
+    return render_template_string(POWER_TEMPLATE, message=message, status=status)
+
+
+@app.route('/power/schedule', methods=['POST'])
+@login_required
+def power_schedule():
+    action = request.form.get('action', '').strip()
+    seconds_raw = request.form.get('seconds', '0').strip()
+    try:
+        seconds = int(seconds_raw)
+    except ValueError:
+        return redirect(url_for('power_page', message='Süre sayısal olmalı.'))
+
+    if action == 'shutdown':
+        _, msg = power_service.schedule_shutdown(seconds)
+    elif action == 'reboot':
+        _, msg = power_service.schedule_reboot(seconds)
+    else:
+        msg = 'Geçersiz işlem türü.'
+    return redirect(url_for('power_page', message=msg))
+
+
+@app.route('/power/cancel', methods=['POST'])
+@login_required
+def power_cancel():
+    _, msg = power_service.cancel_scheduled()
+    return redirect(url_for('power_page', message=msg))
+
+
+@app.route('/ap')
+@login_required
+def ap_page():
+    message = request.args.get('message', '')
+    status = ap_service.status()
+    ok, clients, err = ap_service.clients()
+    if not ok:
+        message = (message + ' | ' if message else '') + err
+    return render_template_string(
+        AP_TEMPLATE,
+        message=message,
+        status=status,
+        clients=clients,
+        default_ssid=AP_SSID,
+    )
+
+
+@app.route('/ap/start', methods=['POST'])
+@login_required
+def ap_start():
+    ssid = request.form.get('ssid', '').strip()
+    password = request.form.get('password', '').strip()
+    _, msg = ap_service.start(ssid=ssid, password=password)
+    return redirect(url_for('ap_page', message=msg))
+
+
+@app.route('/ap/stop', methods=['POST'])
+@login_required
+def ap_stop():
+    _, msg = ap_service.stop()
+    return redirect(url_for('ap_page', message=msg))
+
+
 # ================= TELEGRAM BOT =================
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -372,6 +721,18 @@ def send_welcome(message):
         "/ps [filtre] - Süreçleri listele\n"
         "/kill <pid> - SIGTERM gönder\n"
         "/kill9 <pid> - SIGKILL gönder\n"
+        "/usb_list - Takılı USB'leri listele\n"
+        "/usb_copy <mountpoint> - USB'yi anlık kopyala\n"
+        "/usb_auto <on|off> - Otomatik USB kopyalama\n"
+        "/usb_status - USB izleyici durumunu göster\n"
+        "/shutdown <saniye> - Gecikmeli kapatma\n"
+        "/reboot <saniye> - Gecikmeli yeniden başlatma\n"
+        "/power_cancel - Planlı güç işlemlerini iptal et\n"
+        "/power_status - Planlı güç durumu\n"
+        "/ap_start [ssid] [parola] - AP başlat\n"
+        "/ap_stop - AP durdur\n"
+        "/ap_status - AP durumunu göster\n"
+        "/ap_clients - AP istemcilerini göster\n"
         "Belge/fotoğraf gönder - Aktif dizine kaydet"
     ))
 
@@ -486,8 +847,8 @@ def tg_run(message):
         bot.reply_to(message, f"Dosya bulunamadı: {file_path}")
         return
     try:
-        proc, log_path = _launch_file(file_path)
-        bot.reply_to(message, f"✅ Başlatıldı\nPID: {proc.pid}\nLog: {log_path}")
+        proc = _launch_file(file_path)
+        bot.reply_to(message, f"✅ Başlatıldı\nPID: {proc.pid}")
     except Exception as exc:
         bot.reply_to(message, f"❌ Hata: {exc}")
 
@@ -538,12 +899,184 @@ def tg_kill9(message):
         bot.reply_to(message, f"❌ Hata: {exc}")
 
 
+@bot.message_handler(commands=['usb_list'])
+def tg_usb_list(message):
+    if not check_auth(message):
+        return
+    devices = usb_service.list_mounts()
+    if not devices:
+        bot.reply_to(message, "Takılı USB bulunamadı.")
+        return
+    lines = ["Takılı USB'ler:"]
+    for dev in devices[:20]:
+        lines.append(f"- {dev['mountpoint']} ({dev['device']})")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=['usb_copy'])
+def tg_usb_copy(message):
+    if not check_auth(message):
+        return
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, "Kullanım: /usb_copy <mountpoint>")
+        return
+    mountpoint = args[1].strip()
+    _, msg = usb_service.trigger_copy(mountpoint)
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['usb_auto'])
+def tg_usb_auto(message):
+    if not check_auth(message):
+        return
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, "Kullanım: /usb_auto <on|off>")
+        return
+    mode = args[1].strip().lower()
+    if mode not in ('on', 'off'):
+        bot.reply_to(message, "Geçersiz değer. on/off kullan.")
+        return
+    enabled = mode == 'on'
+    _, msg = usb_service.set_auto_enabled(enabled)
+    if enabled:
+        usb_service.start_auto_monitor()
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['usb_status'])
+def tg_usb_status(message):
+    if not check_auth(message):
+        return
+    status = usb_service.get_status()
+    bot.reply_to(
+        message,
+        (
+            f"USB auto: {'Açık' if status['auto_enabled'] else 'Kapalı'}\n"
+            f"İzleyici: {'Çalışıyor' if status['monitor_running'] else 'Durdu'}\n"
+            f"Aktif iş sayısı: {len(status['active_jobs'])}\n"
+            f"Yedek hedefi: {status['backup_root']}"
+        ),
+    )
+
+
+def _tg_parse_seconds(message, command_name):
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, f"Kullanım: /{command_name} <saniye>")
+        return None
+    try:
+        return int(args[1].strip())
+    except ValueError:
+        bot.reply_to(message, "Süre sayısal olmalı.")
+        return None
+
+
+@bot.message_handler(commands=['shutdown'])
+def tg_shutdown(message):
+    if not check_auth(message):
+        return
+    seconds = _tg_parse_seconds(message, 'shutdown')
+    if seconds is None:
+        return
+    _, msg = power_service.schedule_shutdown(seconds)
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['reboot'])
+def tg_reboot(message):
+    if not check_auth(message):
+        return
+    seconds = _tg_parse_seconds(message, 'reboot')
+    if seconds is None:
+        return
+    _, msg = power_service.schedule_reboot(seconds)
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['power_cancel'])
+def tg_power_cancel(message):
+    if not check_auth(message):
+        return
+    _, msg = power_service.cancel_scheduled()
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['power_status'])
+def tg_power_status(message):
+    if not check_auth(message):
+        return
+    status = power_service.status()
+    if not status['scheduled']:
+        bot.reply_to(message, "Planlı güç işlemi yok.")
+        return
+    lines = ["Planlı güç işlemleri:"]
+    for item in status['scheduled']:
+        lines.append(f"- {item['unit']} ({'aktif' if item['active'] else 'pasif'})")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=['ap_start'])
+def tg_ap_start(message):
+    if not check_auth(message):
+        return
+    parts = message.text.split(' ')
+    ssid = parts[1].strip() if len(parts) > 1 else ""
+    password = parts[2].strip() if len(parts) > 2 else ""
+    _, msg = ap_service.start(ssid=ssid, password=password)
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['ap_stop'])
+def tg_ap_stop(message):
+    if not check_auth(message):
+        return
+    _, msg = ap_service.stop()
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=['ap_status'])
+def tg_ap_status(message):
+    if not check_auth(message):
+        return
+    status = ap_service.status()
+    active_count = len(status['active_wifi'])
+    bot.reply_to(
+        message,
+        (
+            f"AP enabled: {'Evet' if status['enabled'] else 'Hayır'}\n"
+            f"nmcli: {'Var' if status['nmcli_exists'] else 'Yok'}\n"
+            f"Ayar arayüzü: {status['interface']}\n"
+            f"Aktif Wi-Fi bağlantısı: {active_count}"
+        ),
+    )
+
+
+@bot.message_handler(commands=['ap_clients'])
+def tg_ap_clients(message):
+    if not check_auth(message):
+        return
+    ok, clients, err = ap_service.clients()
+    if not ok:
+        bot.reply_to(message, f"Hata: {err}")
+        return
+    if not clients:
+        bot.reply_to(message, "Bağlı istemci yok.")
+        return
+    bot.reply_to(message, "Bağlı istemciler:\n" + "\n".join(f"- {c}" for c in clients))
+
+
 # ================= ÇALIŞTIRMA MANTIĞI =================
 def run_flask():
     # log_output=False ile terminali kirletmesini önleyebilirsin, debug=False olmalı
     app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
+    if USB_AUTO_ENABLED:
+        ok, msg = usb_service.start_auto_monitor()
+        print(f"[*] {msg}")
+
     print(f"[*] Web arayüzü başlatılıyor... (Port: {WEB_PORT})")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
