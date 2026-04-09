@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FileManager Mini App</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>FileManager</h1>
+      <div id="auth-state">Baglaniyor...</div>
+    </header>
+
+    <nav class="tabs">
+      <button data-tab="files" class="active">Files</button>
+      <button data-tab="processes">Processes</button>
+      <button data-tab="usb">USB</button>
+      <button data-tab="power">Power</button>
+      <button data-tab="ap">AP</button>
+    </nav>
+
+    <section id="tab-files" class="tab active">
+      <div class="row">
+        <input id="files-path" type="text" value="/" />
+        <button id="files-refresh">Listele</button>
+      </div>
+      <div id="files-list" class="panel"></div>
+    </section>
+
+    <section id="tab-processes" class="tab">
+      <div class="row">
+        <input id="proc-filter" type="text" placeholder="Filtre" />
+        <button id="proc-refresh">Kisa Liste</button>
+        <button id="proc-full">Tam Liste</button>
+      </div>
+      <div id="proc-list" class="panel"></div>
+    </section>
+
+    <section id="tab-usb" class="tab">
+      <div class="row">
+        <button id="usb-refresh">Yenile</button>
+      </div>
+      <div id="usb-list" class="panel"></div>
+    </section>
+
+    <section id="tab-power" class="tab">
+      <div class="row">
+        <input id="power-seconds" type="number" min="0" max="86400" value="30" />
+        <button id="power-shutdown">Shutdown</button>
+        <button id="power-reboot">Reboot</button>
+        <button id="power-cancel">Cancel</button>
+      </div>
+      <div id="power-status" class="panel"></div>
+    </section>
+
+    <section id="tab-ap" class="tab">
+      <div class="row">
+        <input id="ap-ssid" type="text" placeholder="SSID" />
+        <input id="ap-password" type="password" placeholder="Password" />
+        <button id="ap-start">Baslat</button>
+        <button id="ap-stop">Durdur</button>
+      </div>
+      <div id="ap-status" class="panel"></div>
+    </section>
+
+    <pre id="status"></pre>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

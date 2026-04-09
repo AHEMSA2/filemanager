@@ -1,14 +1,19 @@
 import json
+import hmac
+import hashlib
+import io
 import os
 import signal
 import shutil
 import subprocess
 import sys
 import threading
+import time
+from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import telebot
-from flask import Flask, redirect, render_template_string, request, send_file, session, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from werkzeug.utils import secure_filename
 
 from services import APService, PowerService, USBService
@@ -58,6 +63,10 @@ def _load_config():
     _optional("ap_interface", str, "auto")
     _optional("ap_ssid", str, "FileManager-AP")
     _optional("ap_password", str, "ChangeMe123")
+    _optional("miniapp_enabled", bool, True)
+    _optional("miniapp_url", str, "")
+    _optional("miniapp_allowed_user_ids", list, [cfg.get("allowed_chat_id")])
+    _optional("miniapp_initdata_max_age_seconds", int, 86400)
 
     if isinstance(cfg.get("power_min_seconds"), int) and isinstance(cfg.get("power_max_seconds"), int):
         if cfg["power_min_seconds"] < 0 or cfg["power_max_seconds"] < cfg["power_min_seconds"]:
@@ -65,6 +74,12 @@ def _load_config():
 
     if cfg.get("ap_enabled") and isinstance(cfg.get("ap_password"), str) and len(cfg["ap_password"]) < 8:
         errors.append("  - 'ap_password' en az 8 karakter olmalı")
+
+    if isinstance(cfg.get("miniapp_allowed_user_ids"), list):
+        if not all(isinstance(uid, int) for uid in cfg["miniapp_allowed_user_ids"]):
+            errors.append("  - 'miniapp_allowed_user_ids' yalnızca integer liste olmalı")
+    else:
+        errors.append("  - 'miniapp_allowed_user_ids' liste olmalı")
 
     if errors:
         sys.exit("[!] config.json hataları:\n" + "\n".join(errors))
@@ -86,11 +101,21 @@ AP_ENABLED = _cfg["ap_enabled"]
 AP_INTERFACE = _cfg["ap_interface"]
 AP_SSID = _cfg["ap_ssid"]
 AP_PASSWORD = _cfg["ap_password"]
+MINIAPP_ENABLED = _cfg["miniapp_enabled"]
+MINIAPP_URL = _cfg["miniapp_url"]
+MINIAPP_ALLOWED_USER_IDS = set(_cfg["miniapp_allowed_user_ids"] or [ALLOWED_CHAT_ID])
+MINIAPP_INITDATA_MAX_AGE_SECONDS = _cfg["miniapp_initdata_max_age_seconds"]
 
 # ================= SABİTLER =================
 MAX_CMDLINE_WEB  = 120   # web süreç listesinde gösterilecek komut karakter limiti
 MAX_CMDLINE_TG   = 40    # Telegram mesajında gösterilecek komut karakter limiti
 MAX_PROCESSES    = 40    # gösterilecek maksimum süreç sayısı
+
+MINIAPP_ORIGIN = ""
+if MINIAPP_URL:
+    parsed_miniapp = urlparse(MINIAPP_URL)
+    if parsed_miniapp.scheme and parsed_miniapp.netloc:
+        MINIAPP_ORIGIN = f"{parsed_miniapp.scheme}://{parsed_miniapp.netloc}"
 
 try:
     usb_service = USBService(USB_BACKUP_DIR, auto_enabled=USB_AUTO_ENABLED)
@@ -550,6 +575,22 @@ def _launch_file(file_path):
     return proc
 
 
+def _resolve_user_path(chat_id, raw_path, default_to_current=False):
+    current = get_upload_dir(chat_id)
+    if not raw_path:
+        return current if default_to_current else ""
+
+    raw = raw_path.strip()
+    if raw.startswith("~"):
+        resolved = os.path.expanduser(raw)
+    elif os.path.isabs(raw):
+        resolved = raw
+    else:
+        resolved = os.path.join(current, raw)
+
+    return os.path.abspath(os.path.normpath(resolved))
+
+
 @app.route('/run_file')
 @login_required
 def run_file():
@@ -563,7 +604,7 @@ def run_file():
         return f"Dosya başlatılamadı: {exc}", 500
 
 
-def _get_processes(filter_text=""):
+def _get_processes(filter_text="", limit=MAX_PROCESSES, cmdline_limit=MAX_CMDLINE_WEB):
     procs = []
     for p in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
@@ -572,10 +613,13 @@ def _get_processes(filter_text=""):
             name = info.get('name') or ""
             if filter_text and filter_text.lower() not in name.lower() and filter_text.lower() not in cmdline.lower():
                 continue
-            procs.append({"pid": info['pid'], "name": name, "cmdline": cmdline[:MAX_CMDLINE_WEB]})
+            short_cmd = cmdline[:cmdline_limit] if cmdline_limit else cmdline
+            procs.append({"pid": info['pid'], "name": name, "cmdline": short_cmd})
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return procs[:MAX_PROCESSES]
+    if limit is None:
+        return procs
+    return procs[:limit]
 
 
 @app.route('/processes')
@@ -697,6 +741,250 @@ def ap_stop():
     return redirect(url_for('ap_page', message=msg))
 
 
+def _verify_miniapp_init_data(init_data_raw):
+    try:
+        params = dict(parse_qsl(init_data_raw, keep_blank_values=True))
+        client_hash = params.pop("hash", "")
+        if not client_hash:
+            return None
+
+        data_to_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+        signature = hmac.new(secret_key, data_to_check.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(signature, client_hash):
+            return None
+
+        auth_date = int(params.get("auth_date", "0"))
+        if int(time.time()) - auth_date > MINIAPP_INITDATA_MAX_AGE_SECONDS:
+            return None
+
+        user_json = params.get("user", "")
+        if not user_json:
+            return None
+        user = json.loads(user_json)
+        user_id = int(user.get("id"))
+        if user_id not in MINIAPP_ALLOWED_USER_IDS:
+            return None
+        return user
+    except Exception:
+        return None
+
+
+def _api_auth_required(f):
+    def wrapper(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return ("", 204)
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        init_data_raw = auth_header[7:]
+        user = _verify_miniapp_init_data(init_data_raw)
+        if not user:
+            return jsonify({"ok": False, "error": "Invalid auth"}), 403
+        return f(*args, **kwargs)
+
+    wrapper.__name__ = f.__name__
+    return wrapper
+
+
+@app.after_request
+def _apply_api_cors(resp):
+    if request.path.startswith("/api/"):
+        origin = request.headers.get("Origin", "")
+        if MINIAPP_ORIGIN and origin == MINIAPP_ORIGIN:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+        elif not MINIAPP_ORIGIN:
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+@app.route('/api/auth', methods=['POST', 'OPTIONS'])
+def api_auth():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    init_data_raw = data.get("initData", "")
+    user = _verify_miniapp_init_data(init_data_raw)
+    if not user:
+        return jsonify({"ok": False, "error": "Invalid auth"}), 403
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": user.get("id"),
+            "username": user.get("username", ""),
+            "first_name": user.get("first_name", ""),
+        },
+    })
+
+
+@app.route('/api/files/list', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_files_list():
+    data = request.get_json(silent=True) or {}
+    path = data.get("path", BASE_DIR)
+    try:
+        items = os.listdir(path)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    folders = []
+    files = []
+    for item in items:
+        full = os.path.join(path, item)
+        if os.path.isdir(full):
+            folders.append(item)
+        else:
+            files.append(item)
+    return jsonify({"ok": True, "path": path, "folders": sorted(folders), "files": sorted(files)})
+
+
+@app.route('/api/files/run', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_files_run():
+    data = request.get_json(silent=True) or {}
+    file_path = data.get("file", "")
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({"ok": False, "error": "Dosya bulunamadı"}), 404
+    try:
+        proc = _launch_file(file_path)
+        return jsonify({"ok": True, "pid": proc.pid})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route('/api/files/download_link', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_files_download_link():
+    data = request.get_json(silent=True) or {}
+    file_path = data.get("file", "")
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({"ok": False, "error": "Dosya bulunamadı"}), 404
+    auth_header = request.headers.get("Authorization", "")
+    init_data_raw = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    url = url_for("api_files_download", file=file_path, initData=init_data_raw)
+    return jsonify({"ok": True, "url": url})
+
+
+@app.route('/api/files/download', methods=['GET'])
+def api_files_download():
+    file_path = request.args.get("file", "")
+    init_data_raw = request.args.get("initData", "")
+    if not _verify_miniapp_init_data(init_data_raw):
+        return "Unauthorized", 403
+    if not file_path or not os.path.isfile(file_path):
+        return "Dosya bulunamadı", 404
+    return send_file(file_path, as_attachment=True)
+
+
+@app.route('/api/processes/list', methods=['GET', 'OPTIONS'])
+@_api_auth_required
+def api_processes_list():
+    filter_text = request.args.get("filter", "")
+    full = request.args.get("full", "0") == "1"
+    procs = _get_processes(
+        filter_text=filter_text,
+        limit=None if full else MAX_PROCESSES,
+        cmdline_limit=None if full else MAX_CMDLINE_WEB,
+    )
+    return jsonify({"ok": True, "processes": procs})
+
+
+@app.route('/api/processes/kill', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_processes_kill():
+    data = request.get_json(silent=True) or {}
+    pid = int(data.get("pid", 0))
+    sig_name = data.get("sig", "SIGTERM")
+    sig = signal.SIGKILL if sig_name == "SIGKILL" else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+        return jsonify({"ok": True, "message": f"PID {pid} -> {sig_name}"})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.route('/api/usb/list', methods=['GET', 'OPTIONS'])
+@_api_auth_required
+def api_usb_list():
+    return jsonify({"ok": True, "devices": usb_service.list_mounts(), "status": usb_service.get_status()})
+
+
+@app.route('/api/usb/copy', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_usb_copy():
+    data = request.get_json(silent=True) or {}
+    ok, msg = usb_service.trigger_copy(data.get("mountpoint", ""))
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route('/api/usb/toggle', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_usb_toggle():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enable", True))
+    ok, msg = usb_service.set_auto_enabled(enabled)
+    if ok and enabled:
+        usb_service.start_auto_monitor()
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route('/api/power/status', methods=['GET', 'OPTIONS'])
+@_api_auth_required
+def api_power_status():
+    return jsonify({"ok": True, "status": power_service.status()})
+
+
+@app.route('/api/power/schedule', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_power_schedule():
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "")
+    seconds = int(data.get("seconds", 0))
+    if action == "shutdown":
+        ok, msg = power_service.schedule_shutdown(seconds)
+    elif action == "reboot":
+        ok, msg = power_service.schedule_reboot(seconds)
+    else:
+        ok, msg = False, "Geçersiz işlem türü"
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route('/api/power/cancel', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_power_cancel():
+    ok, msg = power_service.cancel_scheduled()
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route('/api/ap/status', methods=['GET', 'OPTIONS'])
+@_api_auth_required
+def api_ap_status():
+    ok, clients, err = ap_service.clients()
+    return jsonify({
+        "ok": True,
+        "status": ap_service.status(),
+        "clients": clients if ok else [],
+        "clients_error": "" if ok else err,
+    })
+
+
+@app.route('/api/ap/start', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_ap_start():
+    data = request.get_json(silent=True) or {}
+    ok, msg = ap_service.start(ssid=data.get("ssid", ""), password=data.get("password", ""))
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route('/api/ap/stop', methods=['POST', 'OPTIONS'])
+@_api_auth_required
+def api_ap_stop():
+    ok, msg = ap_service.stop()
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
 # ================= TELEGRAM BOT =================
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -712,15 +1000,26 @@ def get_upload_dir(chat_id):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     if not check_auth(message): return
+    if MINIAPP_ENABLED and MINIAPP_URL:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                text="📱 Mini App Aç",
+                web_app=telebot.types.WebAppInfo(url=MINIAPP_URL),
+            )
+        )
+        bot.send_message(message.chat.id, "Mini App için butona tıkla:", reply_markup=markup)
+
     bot.reply_to(message, (
         "Yönetici Paneli Aktif.\nKomutlar:\n"
         "/ls [dizin] - Klasör içeriği\n"
-        "/get [dosya_yolu] - Dosya indir\n"
-        "/cd [dizin] - Yükleme hedef dizinini ayarla\n"
+        "/get [dosya_yolu] - Dosya indir (relative destekli)\n"
+        "/cd [dizin] - Çalışma/yükleme dizinini ayarla (örn: /cd ..)\n"
         "/run <dosya_yolu> - Dosyayı arka planda çalıştır\n"
-        "/ps [filtre] - Süreçleri listele\n"
-        "/kill <pid> - SIGTERM gönder\n"
-        "/kill9 <pid> - SIGKILL gönder\n"
+        "/ps [filtre] - Süreçleri kısa listele\n"
+        "/ps full [filtre] - Tüm süreçleri TXT olarak gönder\n"
+        "/kill <pid> - Nazik sonlandırma (SIGTERM)\n"
+        "/kill9 <pid> - Zorla sonlandırma (SIGKILL)\n"
         "/usb_list - Takılı USB'leri listele\n"
         "/usb_copy <mountpoint> - USB'yi anlık kopyala\n"
         "/usb_auto <on|off> - Otomatik USB kopyalama\n"
@@ -741,7 +1040,7 @@ def list_dir(message):
     if not check_auth(message): return
     
     args = message.text.split(' ', 1)
-    path = args[1] if len(args) > 1 else BASE_DIR
+    path = _resolve_user_path(message.chat.id, args[1] if len(args) > 1 else "", default_to_current=True)
     
     try:
         items = os.listdir(path)
@@ -760,7 +1059,7 @@ def get_file(message):
         bot.reply_to(message, "Kullanım: /get /tam/dosya/yolu.txt")
         return
         
-    file_path = args[1]
+    file_path = _resolve_user_path(message.chat.id, args[1])
     try:
         with open(file_path, 'rb') as f:
             bot.send_document(message.chat.id, f)
@@ -777,7 +1076,7 @@ def change_upload_dir(message):
         bot.reply_to(message, f"Mevcut yükleme dizini: {current}\nKullanım: /cd /yeni/dizin")
         return
 
-    target = args[1].strip()
+    target = _resolve_user_path(message.chat.id, args[1])
     if not os.path.isdir(target):
         bot.reply_to(message, f"Dizin bulunamadı: {target}")
         return
@@ -842,7 +1141,7 @@ def tg_run(message):
     if len(args) < 2:
         bot.reply_to(message, "Kullanım: /run /tam/dosya/yolu")
         return
-    file_path = args[1].strip()
+    file_path = _resolve_user_path(message.chat.id, args[1])
     if not os.path.isfile(file_path):
         bot.reply_to(message, f"Dosya bulunamadı: {file_path}")
         return
@@ -857,8 +1156,32 @@ def tg_run(message):
 def tg_ps(message):
     if not check_auth(message): return
     args = message.text.split(' ', 1)
-    filter_text = args[1].strip() if len(args) > 1 else ""
-    procs = _get_processes(filter_text)
+    mode = "short"
+    filter_text = ""
+    if len(args) > 1:
+        tail = args[1].strip()
+        parts = tail.split(' ', 1)
+        if parts[0].lower() in ("full", "txt"):
+            mode = "full"
+            filter_text = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            filter_text = tail
+
+    if mode == "full":
+        procs = _get_processes(filter_text=filter_text, limit=None, cmdline_limit=None)
+        if not procs:
+            bot.reply_to(message, "Süreç bulunamadı.")
+            return
+        rows = ["PID\tNAME\tCMDLINE"]
+        for p in procs:
+            rows.append(f"{p['pid']}\t{p['name']}\t{p['cmdline']}")
+        text = "\n".join(rows)
+        bio = io.BytesIO(text.encode("utf-8", errors="replace"))
+        bio.name = f"processes_{int(time.time())}.txt"
+        bot.send_document(message.chat.id, bio)
+        return
+
+    procs = _get_processes(filter_text=filter_text)
     if not procs:
         bot.reply_to(message, "Süreç bulunamadı.")
         return

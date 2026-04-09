@@ -32,6 +32,10 @@ python main.py
 | `ap_interface` | string | AP Wi-Fi arayüzü (`auto` önerilir) |
 | `ap_ssid` | string | Varsayılan Access Point adı |
 | `ap_password` | string | Varsayılan Access Point parolası (en az 8 karakter) |
+| `miniapp_enabled` | bool | Telegram Mini App API erişimini aç/kapat |
+| `miniapp_url` | string | Telegram içinde açılacak Mini App URL'i |
+| `miniapp_allowed_user_ids` | int[] | Mini App API erişimine izinli Telegram kullanıcı ID listesi |
+| `miniapp_initdata_max_age_seconds` | integer | Mini App auth verisinin maksimum geçerlilik süresi |
 
 > **Önemli:** `config.json` içinde token/parola bulunur. Repo'ya commit etme.
 
@@ -41,12 +45,13 @@ python main.py
 |---|---|
 | `/start` / `/help` | Yardım menüsünü göster |
 | `/ls [dizin]` | Dizin içeriğini listele |
-| `/get <dosya_yolu>` | Dosyayı Telegram'a gönder |
-| `/cd <dizin>` | Telegram upload hedefini değiştir |
+| `/get <dosya_yolu>` | Dosyayı Telegram'a gönder (relative destekli) |
+| `/cd <dizin>` | Aktif çalışma/yükleme dizinini değiştir (`/cd ..` destekli) |
 | `/run <dosya_yolu>` | Dosyayı arka planda başlat (PID döner) |
-| `/ps [filtre]` | Çalışan süreçleri listele (opsiyonel filtre) |
-| `/kill <pid>` | Sürece SIGTERM gönder |
-| `/kill9 <pid>` | Sürece SIGKILL gönder |
+| `/ps [filtre]` | Çalışan süreçleri kısa listele |
+| `/ps full [filtre]` | Süreçleri full TXT olarak gönder |
+| `/kill <pid>` | Nazik sonlandırma (SIGTERM) |
+| `/kill9 <pid>` | Zorla sonlandırma (SIGKILL) |
 | `/usb_list` | Takılı USB mountpoint listesini göster |
 | `/usb_copy <mountpoint>` | Belirli mountpoint için anlık kopyalama başlat |
 | `/usb_auto <on|off>` | USB otomatik kopyalamayı aç/kapat |
@@ -69,6 +74,25 @@ python main.py
 - `/power` — Zamanlanmış kapatma/yeniden başlatma + iptal
 - `/ap` — Access Point başlat/durdur/durum/istemciler
 
+## Telegram Mini App
+
+- Bot `/start` komutu içinde `Mini App Aç` butonu gönderir.
+- Frontend dosyaları: `miniapp/` klasörü.
+- Mini App backend API endpointleri: `/api/*`
+- API auth: Telegram `initData` doğrulaması + `miniapp_allowed_user_ids` whitelist kontrolü.
+
+### Cloudflare Pages Kurulum
+
+1. Bu repoyu Cloudflare Pages'e bağla.
+2. Build command boş bırak.
+3. Output directory: `miniapp`.
+4. Yayınlanan URL'i `config.json` içindeki `miniapp_url` alanına yaz.
+5. Servisi yeniden başlat:
+
+```bash
+systemctl restart filemanager
+```
+
 ## `/run` Komutu Davranışı
 
 - Dosya **executable** ise doğrudan çalıştırılır.
@@ -77,6 +101,11 @@ python main.py
 - Diğer uzantılar için `xdg-open` denenir.
 - `subprocess.Popen` kullanılır — bloklamaz.
 - stdout/stderr log dosyasına yazılmaz.
+
+## `/ps` Komutu Davranışı
+
+- `/ps` : kısa liste (Telegram mesajı)
+- `/ps full` veya `/ps txt` : tüm süreçler TXT dosyası olarak gönderilir
 
 ## Linux Tek Tık Kurulum (Ubuntu/Debian)
 
