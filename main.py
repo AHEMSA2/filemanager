@@ -1,17 +1,68 @@
+import json
 import os
+import signal
+import subprocess
+import sys
 import threading
-from flask import Flask, request, send_file, redirect, url_for, session, render_template_string
-from werkzeug.utils import secure_filename
+
+import psutil
 import telebot
+from flask import Flask, redirect, render_template_string, request, send_file, session, url_for
+from markupsafe import escape
+from werkzeug.utils import secure_filename
 
-# ================= AYARLAR =================
-WEB_PASSWORD = "admin" # Web arayüzü giriş şifresi
-WEB_PORT = 5000
-BASE_DIR = "/" # Başlangıç dizini
+# ================= CONFIG =================
 
-# Telegram Ayarları
-BOT_TOKEN = "BURAYA_BOT_TOKEN_YAZ"
-ALLOWED_CHAT_ID = 123456789 # Kendi Telegram ID'ni GİR! (Güvenlik için kritik)
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_config():
+    if not os.path.exists(_CONFIG_PATH):
+        sys.exit(
+            f"[!] config.json bulunamadı: {_CONFIG_PATH}\n"
+            "    Lütfen config.example.json dosyasını config.json olarak kopyalayıp doldurun.\n"
+            "    cp config.example.json config.json"
+        )
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
+        try:
+            cfg = json.load(fh)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"[!] config.json geçersiz JSON: {exc}")
+
+    errors = []
+    def _require(key, expected_type):
+        if key not in cfg:
+            errors.append(f"  - '{key}' alanı eksik")
+        elif not isinstance(cfg[key], expected_type):
+            errors.append(f"  - '{key}' alanı {expected_type.__name__} olmalı, şu an: {type(cfg[key]).__name__}")
+
+    _require("bot_token", str)
+    _require("allowed_chat_id", int)
+    _require("web_password", str)
+    _require("web_port", int)
+    _require("base_dir", str)
+    _require("logs_dir", str)
+
+    if errors:
+        sys.exit("[!] config.json hataları:\n" + "\n".join(errors))
+
+    return cfg
+
+_cfg = _load_config()
+
+BOT_TOKEN       = _cfg["bot_token"]
+ALLOWED_CHAT_ID = _cfg["allowed_chat_id"]
+WEB_PASSWORD    = _cfg["web_password"]
+WEB_PORT        = _cfg["web_port"]
+BASE_DIR        = _cfg["base_dir"]
+LOGS_DIR        = _cfg["logs_dir"]
+
+# Logs dizinini oluştur
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+# ================= SABİTLER =================
+MAX_CMDLINE_WEB  = 120   # web süreç listesinde gösterilecek komut karakter limiti
+MAX_CMDLINE_TG   = 40    # Telegram mesajında gösterilecek komut karakter limiti
+MAX_PROCESSES    = 40    # gösterilecek maksimum süreç sayısı
 
 # ================= HTML ŞABLONU =================
 HTML_TEMPLATE = """
@@ -28,10 +79,17 @@ HTML_TEMPLATE = """
         .item { padding: 5px 0; border-bottom: 1px solid #21262d; }
         input[type="text"], input[type="password"] { background: #0d1117; color: white; border: 1px solid #30363d; padding: 5px; }
         input[type="submit"], button { background: #238636; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .btn-run { background: #9e6a03; color: white; border: none; padding: 3px 8px; cursor: pointer; font-size: 0.85em; }
+        .nav-links { margin-bottom: 10px; }
+        .nav-links a { margin-right: 15px; }
     </style>
 </head>
 <body>
     <div class="container">
+        <div class="nav-links">
+            <a href="/">📁 Dosya Yöneticisi</a>
+            <a href="/processes">⚙️ Süreçler</a>
+        </div>
         <h2>Dizin: {{ path }}</h2>
         
         <div class="panel">
@@ -66,10 +124,80 @@ HTML_TEMPLATE = """
                 <h3>Dosyalar</h3>
                 {% for file in files %}
                 <div class="item">📄 {{ file }} 
-                    <span style="float:right;">[<a href="/download?file={{ path.rstrip('/') }}/{{ file }}">İndir</a>]</span>
+                    <span style="float:right;">
+                        [<a href="/download?file={{ path.rstrip('/') }}/{{ file }}">İndir</a>]
+                        &nbsp;
+                        [<a href="/run_file?file={{ path.rstrip('/') }}/{{ file }}" class="btn-run" onclick="return confirm('{{ file }} çalıştırılsın mı?')">▶ Çalıştır</a>]
+                    </span>
                 </div>
                 {% endfor %}
             {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+PROCESSES_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Süreçler - Server Manager</title>
+    <style>
+        body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .panel { background: #161b22; padding: 15px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-size: 0.85em; }
+        .btn-kill { background: #da3633; color: white; border: none; padding: 3px 8px; cursor: pointer; font-size: 0.85em; }
+        .nav-links { margin-bottom: 10px; }
+        .nav-links a { margin-right: 15px; }
+        input[type="text"] { background: #0d1117; color: white; border: 1px solid #30363d; padding: 5px; }
+        input[type="submit"] { background: #238636; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .flash { padding: 10px; background: #1f2d1f; border: 1px solid #238636; border-radius: 4px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-links">
+            <a href="/">📁 Dosya Yöneticisi</a>
+            <a href="/processes">⚙️ Süreçler</a>
+        </div>
+        <h2>⚙️ Çalışan Süreçler</h2>
+
+        {% if message %}
+        <div class="flash">{{ message }}</div>
+        {% endif %}
+
+        <div class="panel">
+            <form method="get" action="/processes" style="margin-bottom:10px;">
+                <input type="text" name="filter" value="{{ filter_text }}" placeholder="Süreç adı filtrele...">
+                <input type="submit" value="Filtrele">
+            </form>
+            <table>
+                <thead>
+                    <tr><th>PID</th><th>İsim</th><th>Komut</th><th>İşlem</th></tr>
+                </thead>
+                <tbody>
+                {% for proc in processes %}
+                <tr>
+                    <td>{{ proc.pid }}</td>
+                    <td>{{ proc.name }}</td>
+                    <td style="max-width:500px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ proc.cmdline }}</td>
+                    <td>
+                        <form method="post" action="/kill_process" style="display:inline;">
+                            <input type="hidden" name="pid" value="{{ proc.pid }}">
+                            <input type="hidden" name="sig" value="SIGTERM">
+                            <button type="submit" class="btn-kill" onclick="return confirm('PID {{ proc.pid }} durdurulsun mu?')">Durdur</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
         </div>
     </div>
 </body>
@@ -143,6 +271,83 @@ def upload():
     return redirect(url_for('index', path=current_path))
 
 
+def _launch_file(file_path):
+    """Launch a file non-blocking; return (proc, log_path) or raise."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    ext = os.path.splitext(file_path)[1].lower()
+    if os.access(file_path, os.X_OK):
+        cmd = [file_path]
+    elif ext == ".py":
+        cmd = ["python3", file_path]
+    elif ext == ".sh":
+        cmd = ["bash", file_path]
+    else:
+        cmd = ["xdg-open", file_path]
+
+    # Placeholder log path — updated after Popen so we know the PID
+    tmp_log = os.path.join(LOGS_DIR, "pending.log")
+    log_fh = open(tmp_log, "w")
+    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh, close_fds=True)
+    log_fh.close()
+
+    log_path = os.path.join(LOGS_DIR, f"{proc.pid}.log")
+    os.rename(tmp_log, log_path)
+    return proc, log_path
+
+
+@app.route('/run_file')
+@login_required
+def run_file():
+    file_path = request.args.get('file', '')
+    if not file_path or not os.path.isfile(file_path):
+        return "Dosya bulunamadı", 404
+    try:
+        proc, log_path = _launch_file(file_path)
+        return f"Başlatıldı — PID: {proc.pid} | Log: {escape(log_path)}", 200
+    except Exception:
+        return "Dosya başlatılamadı.", 500
+
+
+def _get_processes(filter_text=""):
+    procs = []
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            info = p.info
+            cmdline = " ".join(info.get('cmdline') or [])
+            name = info.get('name') or ""
+            if filter_text and filter_text.lower() not in name.lower() and filter_text.lower() not in cmdline.lower():
+                continue
+            procs.append({"pid": info['pid'], "name": name, "cmdline": cmdline[:MAX_CMDLINE_WEB]})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return procs[:MAX_PROCESSES]
+
+
+@app.route('/processes')
+@login_required
+def processes_page():
+    filter_text = request.args.get('filter', '')
+    message = request.args.get('message', '')
+    procs = _get_processes(filter_text)
+    return render_template_string(PROCESSES_TEMPLATE, processes=procs,
+                                  filter_text=filter_text, message=message)
+
+
+@app.route('/kill_process', methods=['POST'])
+@login_required
+def kill_process():
+    pid_str = request.form.get('pid', '')
+    sig_name = request.form.get('sig', 'SIGTERM')
+    sig = signal.SIGKILL if sig_name == 'SIGKILL' else signal.SIGTERM
+    try:
+        pid = int(pid_str)
+        os.kill(pid, sig)
+        msg = f"PID {pid} → {sig_name} gönderildi."
+    except (ValueError, ProcessLookupError, PermissionError) as exc:
+        msg = f"Hata: {exc}"
+    return redirect(url_for('processes_page', message=msg))
+
+
 # ================= TELEGRAM BOT =================
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -163,6 +368,10 @@ def send_welcome(message):
         "/ls [dizin] - Klasör içeriği\n"
         "/get [dosya_yolu] - Dosya indir\n"
         "/cd [dizin] - Yükleme hedef dizinini ayarla\n"
+        "/run <dosya_yolu> - Dosyayı arka planda çalıştır\n"
+        "/ps [filtre] - Süreçleri listele\n"
+        "/kill <pid> - SIGTERM gönder\n"
+        "/kill9 <pid> - SIGKILL gönder\n"
         "Belge/fotoğraf gönder - Aktif dizine kaydet"
     ))
 
@@ -261,6 +470,72 @@ def receive_photo(message):
         bot.reply_to(message, f"Fotoğraf kaydedildi: {save_path}")
     except Exception as e:
         bot.reply_to(message, f"Yükleme başarısız: {str(e)}")
+
+
+# ================= YENİ TELEGRAM KOMUTLARI =================
+
+@bot.message_handler(commands=['run'])
+def tg_run(message):
+    if not check_auth(message): return
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, "Kullanım: /run /tam/dosya/yolu")
+        return
+    file_path = args[1].strip()
+    if not os.path.isfile(file_path):
+        bot.reply_to(message, f"Dosya bulunamadı: {file_path}")
+        return
+    try:
+        proc, log_path = _launch_file(file_path)
+        bot.reply_to(message, f"✅ Başlatıldı\nPID: {proc.pid}\nLog: {log_path}")
+    except Exception as exc:
+        bot.reply_to(message, f"❌ Hata: {exc}")
+
+
+@bot.message_handler(commands=['ps'])
+def tg_ps(message):
+    if not check_auth(message): return
+    args = message.text.split(' ', 1)
+    filter_text = args[1].strip() if len(args) > 1 else ""
+    procs = _get_processes(filter_text)
+    if not procs:
+        bot.reply_to(message, "Süreç bulunamadı.")
+        return
+    lines = [f"{'PID':<7} {'İsim':<20} Komut"]
+    for p in procs:
+        cmd_short = p['cmdline'][:MAX_CMDLINE_TG] if p['cmdline'] else "-"
+        lines.append(f"{p['pid']:<7} {p['name'][:20]:<20} {cmd_short}")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=['kill'])
+def tg_kill(message):
+    if not check_auth(message): return
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, "Kullanım: /kill <pid>")
+        return
+    try:
+        pid = int(args[1].strip())
+        os.kill(pid, signal.SIGTERM)
+        bot.reply_to(message, f"✅ PID {pid} → SIGTERM gönderildi.")
+    except Exception as exc:
+        bot.reply_to(message, f"❌ Hata: {exc}")
+
+
+@bot.message_handler(commands=['kill9'])
+def tg_kill9(message):
+    if not check_auth(message): return
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        bot.reply_to(message, "Kullanım: /kill9 <pid>")
+        return
+    try:
+        pid = int(args[1].strip())
+        os.kill(pid, signal.SIGKILL)
+        bot.reply_to(message, f"✅ PID {pid} → SIGKILL gönderildi.")
+    except Exception as exc:
+        bot.reply_to(message, f"❌ Hata: {exc}")
 
 
 # ================= ÇALIŞTIRMA MANTIĞI =================
