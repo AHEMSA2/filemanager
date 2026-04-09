@@ -1,1 +1,1 @@
-flask pyTelegramBotAPI werkzeug
+flask pyTelegramBotAPI werkzeug psutil
