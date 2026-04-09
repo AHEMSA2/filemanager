@@ -146,13 +146,25 @@ def upload():
 # ================= TELEGRAM BOT =================
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# Per-chat upload directory (defaults to BASE_DIR)
+upload_dirs = {}
+
 def check_auth(message):
     return message.chat.id == ALLOWED_CHAT_ID
+
+def get_upload_dir(chat_id):
+    return upload_dirs.get(chat_id, BASE_DIR)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     if not check_auth(message): return
-    bot.reply_to(message, "Yönetici Paneli Aktif.\nKomutlar:\n/ls [dizin] - Klasör içeriği\n/get [dosya_yolu] - Dosya indir")
+    bot.reply_to(message, (
+        "Yönetici Paneli Aktif.\nKomutlar:\n"
+        "/ls [dizin] - Klasör içeriği\n"
+        "/get [dosya_yolu] - Dosya indir\n"
+        "/cd [dizin] - Yükleme hedef dizinini ayarla\n"
+        "Belge/fotoğraf gönder - Aktif dizine kaydet"
+    ))
 
 @bot.message_handler(commands=['ls'])
 def list_dir(message):
@@ -184,6 +196,71 @@ def get_file(message):
             bot.send_document(message.chat.id, f)
     except Exception as e:
         bot.reply_to(message, f"Dosya çekilemedi: {str(e)}")
+
+@bot.message_handler(commands=['cd'])
+def change_upload_dir(message):
+    if not check_auth(message): return
+
+    args = message.text.split(' ', 1)
+    if len(args) < 2:
+        current = get_upload_dir(message.chat.id)
+        bot.reply_to(message, f"Mevcut yükleme dizini: {current}\nKullanım: /cd /yeni/dizin")
+        return
+
+    target = args[1].strip()
+    if not os.path.isdir(target):
+        bot.reply_to(message, f"Dizin bulunamadı: {target}")
+        return
+
+    upload_dirs[message.chat.id] = target
+    bot.reply_to(message, f"Yükleme dizini ayarlandı: {target}")
+
+def unique_save_path(directory, filename):
+    """Return a path that does not already exist, appending a counter if needed."""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base}_{counter}{ext}")
+        counter += 1
+    return candidate
+
+@bot.message_handler(content_types=['document'])
+def receive_document(message):
+    if not check_auth(message): return
+
+    target_dir = get_upload_dir(message.chat.id)
+    raw_name = message.document.file_name or f"document_{message.document.file_id}"
+    file_name = secure_filename(raw_name)
+    save_path = unique_save_path(target_dir, file_name)
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        with open(save_path, 'wb') as f:
+            f.write(downloaded)
+        bot.reply_to(message, f"Dosya kaydedildi: {save_path}")
+    except Exception as e:
+        bot.reply_to(message, f"Yükleme başarısız: {str(e)}")
+
+@bot.message_handler(content_types=['photo'])
+def receive_photo(message):
+    if not check_auth(message): return
+
+    target_dir = get_upload_dir(message.chat.id)
+    # Use the highest-resolution photo
+    photo = message.photo[-1]
+    try:
+        file_info = bot.get_file(photo.file_id)
+        # Derive extension from the actual file path returned by Telegram
+        ext = os.path.splitext(file_info.file_path)[1] or ".jpg"
+        file_name = secure_filename(f"{photo.file_id}{ext}")
+        save_path = unique_save_path(target_dir, file_name)
+        downloaded = bot.download_file(file_info.file_path)
+        with open(save_path, 'wb') as f:
+            f.write(downloaded)
+        bot.reply_to(message, f"Fotoğraf kaydedildi: {save_path}")
+    except Exception as e:
+        bot.reply_to(message, f"Yükleme başarısız: {str(e)}")
 
 
 # ================= ÇALIŞTIRMA MANTIĞI =================
