@@ -32,10 +32,6 @@ python main.py
 | `ap_interface` | string | AP Wi-Fi arayüzü (`auto` önerilir) |
 | `ap_ssid` | string | Varsayılan Access Point adı |
 | `ap_password` | string | Varsayılan Access Point parolası (en az 8 karakter) |
-| `miniapp_enabled` | bool | Telegram Mini App API erişimini aç/kapat |
-| `miniapp_url` | string | Telegram içinde açılacak Mini App URL'i |
-| `miniapp_allowed_user_ids` | int[] | Mini App API erişimine izinli Telegram kullanıcı ID listesi |
-| `miniapp_initdata_max_age_seconds` | integer | Mini App auth verisinin maksimum geçerlilik süresi |
 
 > **Önemli:** `config.json` içinde token/parola bulunur. Repo'ya commit etme.
 
@@ -73,25 +69,6 @@ python main.py
 - `/usb` — USB izleme, otomatik kopyalama toggle, manuel kopyalama
 - `/power` — Zamanlanmış kapatma/yeniden başlatma + iptal
 - `/ap` — Access Point başlat/durdur/durum/istemciler
-
-## Telegram Mini App
-
-- Bot `/start` komutu içinde `Mini App Aç` butonu gönderir.
-- Frontend dosyaları: `miniapp/` klasörü.
-- Mini App backend API endpointleri: `/api/*`
-- API auth: Telegram `initData` doğrulaması + `miniapp_allowed_user_ids` whitelist kontrolü.
-
-### Cloudflare Pages Kurulum
-
-1. Bu repoyu Cloudflare Pages'e bağla.
-2. Build command boş bırak.
-3. Output directory: `miniapp`.
-4. Yayınlanan URL'i `config.json` içindeki `miniapp_url` alanına yaz.
-5. Servisi yeniden başlat:
-
-```bash
-systemctl restart filemanager
-```
 
 ## `/run` Komutu Davranışı
 

@@ -11,11 +11,5 @@
   "ap_enabled": true,
   "ap_interface": "auto",
   "ap_ssid": "FileManager-AP",
-  "ap_password": "ChangeMe123",
-  "miniapp_enabled": true,
-  "miniapp_url": "https://your-project.pages.dev",
-  "miniapp_allowed_user_ids": [
-    6456580255
-  ],
-  "miniapp_initdata_max_age_seconds": 86400
+  "ap_password": "ChangeMe123"
 }
